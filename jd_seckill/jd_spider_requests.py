@@ -429,9 +429,7 @@ class JdSeckill(object):
         多进程进行抢购
         work_count：进程数量
         """
-        with ProcessPoolExecutor(work_count) as pool:
-            for i in range(work_count):
-                pool.submit(self.seckill)
+        self.seckill()
 
     def _reserve(self):
         """
@@ -449,17 +447,26 @@ class JdSeckill(object):
         """
         抢购
         """
-        while self.running_flag:
-            self.seckill_canstill_running()
-            try:
-                self.request_seckill_url()
-                while self.running_flag:
-                    self.request_seckill_checkout_page()
-                    self.submit_seckill_order()
-                    self.seckill_canstill_running()
-            except Exception as e:
-                logger.info('抢购发生异常，稍后继续执行！', e)
-            wait_some_time()
+        self.seckill_order_data[self.sku_id] = self._get_seckill_order_data()
+
+        self.seckill_url[self.sku_id] = self.get_seckill_url()
+
+        # 提交订单
+        with ProcessPoolExecutor(5) as pool:
+            for i in range(5):
+                pool.submit(self.submit_seckill_order)
+        # self.submit_seckill_order()
+        # while self.running_flag:
+        #     self.seckill_canstill_running()
+        #     try:
+        #         self.request_seckill_url()
+        #         while self.running_flag:
+        #             # self.request_seckill_checkout_page()
+        #             self.submit_seckill_order()
+        #             self.seckill_canstill_running()
+        #     except Exception as e:
+        #         logger.info('抢购发生异常，稍后继续执行！', e)
+        #     wait_some_time()
 
     def seckill_canstill_running(self):
         """用config.ini文件中的continue_time加上函数buytime_get()获取到的buy_time，
@@ -556,7 +563,8 @@ class JdSeckill(object):
             'Host': 'itemko.jd.com',
             'Referer': 'https://item.jd.com/{}.html'.format(self.sku_id),
         }
-        while True:
+        while self.running_flag:
+            self.seckill_canstill_running()
             resp = self.session.get(url=url, headers=headers, params=payload)
             resp_json = parse_json(resp.text)
             if resp_json.get('url'):
@@ -571,13 +579,14 @@ class JdSeckill(object):
             else:
                 logger.info("抢购链接获取失败，稍后自动重试")
                 wait_some_time()
+            self.seckill_canstill_running()
 
     def request_seckill_url(self):
         """访问商品的抢购链接（用于设置cookie等"""
         logger.info('用户:{}'.format(self.get_username()))
         logger.info('商品名称:{}'.format(self.get_sku_title()))
         self.timers.start()
-        self.seckill_url[self.sku_id] = self.get_seckill_url()
+        # self.seckill_url[self.sku_id] = self.get_seckill_url()
         logger.info('访问商品的抢购连接...')
         headers = {
             'User-Agent': self.user_agent,
@@ -688,11 +697,69 @@ class JdSeckill(object):
         payload = {
             'skuId': self.sku_id,
         }
+        # try:
+        #     self.seckill_order_data[self.sku_id] = self._get_seckill_order_data()
+        # except Exception as e:
+        #     logger.info('抢购失败，无法获取生成订单的基本信息，接口返回:【{}】'.format(str(e)))
+        #     return False
+
+        logger.info('提交抢购订单...')
+        headers = {
+            'User-Agent': self.user_agent,
+            'Host': 'marathon.jd.com',
+            'Referer': 'https://marathon.jd.com/seckill/seckill.action?skuId={0}&num={1}&rid={2}'.format(
+                self.sku_id, self.seckill_num, int(time.time())),
+        }
+        resp = self.session.post(
+            url=url,
+            params=payload,
+            data=self.seckill_order_data.get(
+                self.sku_id),
+            headers=headers)
+        resp_json = None
         try:
-            self.seckill_order_data[self.sku_id] = self._get_seckill_order_data()
+            resp_json = parse_json(resp.text)
         except Exception as e:
-            logger.info('抢购失败，无法获取生成订单的基本信息，接口返回:【{}】'.format(str(e)))
+            logger.info('抢购失败，返回信息:{}'.format(resp.text[0: 128]))
             return False
+        # 返回信息
+        # 抢购失败：
+        # {'errorMessage': '很遗憾没有抢到，再接再厉哦。', 'orderId': 0, 'resultCode': 60074, 'skuId': 0, 'success': False}
+        # {'errorMessage': '抱歉，您提交过快，请稍后再提交订单！', 'orderId': 0, 'resultCode': 60017, 'skuId': 0, 'success': False}
+        # {'errorMessage': '系统正在开小差，请重试~~', 'orderId': 0, 'resultCode': 90013, 'skuId': 0, 'success': False}
+        # 抢购成功：
+        # {"appUrl":"xxxxx","orderId":820227xxxxx,"pcUrl":"xxxxx","resultCode":0,"skuId":0,"success":true,"totalMoney":"xxxxx"}
+        if resp_json.get('success'):
+            order_id = resp_json.get('orderId')
+            total_money = resp_json.get('totalMoney')
+            pay_url = 'https:' + resp_json.get('pcUrl')
+            logger.info('抢购成功，订单号:{}, 总价:{}, 电脑端付款链接:{}'.format(order_id, total_money, pay_url))
+            if global_config.getRaw('messenger', 'server_chan_enable') == 'true':
+                success_message = "抢购成功，订单号:{}, 总价:{}, 电脑端付款链接:{}".format(order_id, total_money, pay_url)
+                send_wechat(success_message)
+                self.running_flag = False
+            return True
+        else:
+            logger.info('抢购失败，返回信息:{}'.format(resp_json))
+            if global_config.getRaw('messenger', 'server_chan_enable') == 'true':
+                error_message = '抢购失败，返回信息:{}'.format(resp_json)
+                send_wechat(error_message)
+            return False
+
+
+    def submit_seckill_order1(self):
+        """提交抢购（秒杀）订单
+        :return: 抢购结果 True/False
+        """
+        url = 'https://marathon.jd.com/seckillnew/orderService/pc/submitOrder.action'
+        payload = {
+            'skuId': self.sku_id,
+        }
+        # try:
+        #     self.seckill_order_data[self.sku_id] = self._get_seckill_order_data()
+        # except Exception as e:
+        #     logger.info('抢购失败，无法获取生成订单的基本信息，接口返回:【{}】'.format(str(e)))
+        #     return False
 
         logger.info('提交抢购订单...')
         headers = {
